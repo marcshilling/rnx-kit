@@ -11,12 +11,17 @@ import type { Server as HttpsServer } from "https";
 import type { ReportableEvent, Reporter, RunServerOptions } from "metro";
 import type { Middleware } from "metro-config";
 import type Server from "metro/src/Server";
-import * as os from "os";
 import * as path from "path";
 import qrcode from "qrcode";
 import readline from "readline";
 import { customizeMetroConfig } from "./metro-config";
+import {
+  buildDevServerUrl,
+  fetchConnectedApps,
+  openDevTools,
+} from "./serve/devTools";
 import { getKitServerConfig } from "./serve/kit-config";
+import type { CLIStartOptions } from "./serve/types";
 
 type DevServerMiddleware = ReturnType<
   (typeof CliServerApi)["createDevServerMiddleware"]
@@ -30,22 +35,9 @@ type DevServerMiddleware6 = Pick<DevServerMiddleware, "middleware"> & {
   };
 };
 
-export type CLIStartOptions = {
-  port: number;
-  host: string;
-  projectRoot?: string;
-  watchFolders?: string[];
-  assetPlugins?: string[];
-  sourceExts?: string[];
-  maxWorkers?: number;
-  resetCache?: boolean;
-  customLogReporterPath?: string;
-  https?: boolean;
-  key?: string;
-  cert?: string;
-  config?: string;
-  interactive: boolean;
-  id?: string;
+type KeyPressData = {
+  ctrl: boolean;
+  name: string;
 };
 
 function friendlyRequire<T>(...modules: string[]): T {
@@ -107,12 +99,14 @@ export async function rnxStart(
     [
       ["r", "reload the app"],
       ["d", "open developer menu"],
+      ["j", "open Chrome DevTools"],
       ["a", "show bundler address QR code"],
       ["h", "show this help message"],
       ["ctrl-c", "quit"],
     ].forEach(([key, description]) => {
-      terminal.log(press + key + dim(` to ${description}.`));
+      terminal.log(press + key + dim(` to ${description}`));
     });
+    terminal.log("");
   };
 
   // create a reporter function, to be bound to the Metro configuration.
@@ -227,9 +221,10 @@ export async function rnxStart(
   // them to specific actions.
   if (interactive) {
     readline.emitKeypressEvents(process.stdin);
-
     process.stdin.setRawMode(true);
-    process.stdin.on("keypress", (_key, data) => {
+
+    let currentKeyPressHandler: ((key: string) => void) | undefined;
+    process.stdin.on("keypress", (_key: unknown, data: KeyPressData) => {
       const { ctrl, name } = data;
       if (ctrl === true) {
         switch (name) {
@@ -241,14 +236,14 @@ export async function rnxStart(
             process.emit("SIGTSTP", "SIGTSTP");
             break;
         }
+      } else if (currentKeyPressHandler) {
+        currentKeyPressHandler(name);
       } else {
         switch (name) {
           case "a": {
-            const protocol = cliOptions.https ? "https" : "http";
-            const host = cliOptions.host || os.hostname();
-            const port = metroConfig.server.port;
-            const url = `${protocol}://${host}:${port}/index.bundle`;
-            qrcode.toString(url, { type: "terminal" }, (_err, qr) => {
+            const url = buildDevServerUrl(cliOptions, metroConfig);
+            url.pathname = "/index.bundle";
+            qrcode.toString(url.href, { type: "terminal" }, (_err, qr) => {
               terminal.log("");
               terminal.log(url + ":");
               terminal.log(qr);
@@ -264,6 +259,63 @@ export async function rnxStart(
           case "h":
             printHelp();
             break;
+
+          case "j": {
+            fetchConnectedApps(cliOptions, metroConfig).then((apps) => {
+              if (!Array.isArray(apps) || apps.length === 0) {
+                terminal.log("No apps connected");
+                return;
+              }
+
+              if (apps.length === 1) {
+                terminal.log(chalk.green("Opening DevTools..."));
+                openDevTools(cliConfig, apps[0]);
+                return;
+              }
+
+              const dim = chalk.dim;
+              const separator = dim(" › ");
+              const listTargets = () => {
+                const cancel = dim("(press ") + "esc" + dim(" to cancel)");
+                terminal.log("");
+                terminal.log(`Select a target to inspect ${cancel}:`);
+                terminal.log("");
+                for (let i = 0; i < apps.length; ++i) {
+                  const { title, description } = apps[i];
+                  const id = dim(`[${description}]`);
+                  terminal.log(`   ${i + 1}${separator}${title} ${id}`);
+                }
+                terminal.log("");
+              };
+
+              currentKeyPressHandler = (name) => {
+                if (name === "escape") {
+                  currentKeyPressHandler = undefined;
+                  printHelp();
+                  return;
+                }
+
+                const num = Number.parseInt(name);
+                if (Number.isNaN(num) || num === 0 || num > apps.length) {
+                  return;
+                }
+
+                currentKeyPressHandler = undefined;
+
+                const app = apps[num - 1];
+                terminal.log(
+                  chalk.green(
+                    `Opening DevTools for '${app.title} [${app.description}]'...`
+                  )
+                );
+
+                openDevTools(cliConfig, app);
+              };
+
+              listTargets();
+            });
+            break;
+          }
 
           case "r":
             terminal.log(chalk.green("Reloading app..."));
